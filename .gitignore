@@ -1,0 +1,6 @@
+.swival
+.zig-cache
+*~
+LOG.md
+zig-out
+zig-pkg
