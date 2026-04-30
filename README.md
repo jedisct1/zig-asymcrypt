@@ -106,3 +106,7 @@ Be careful: anything in the environment is generally readable by other processes
 - File output never overwrites an existing path. Pass `--force` if you really mean to clobber it.
 
 File output is staged in a temporary file in the destination directory and renamed into place only after the whole stream has been written and flushed. A crash mid-write leaves no partial file behind.
+
+## Why not just ECIES, HPKE, etc.?
+
+Ordering is cryptographically tied to the number of iterations required to recover the encryption key, and that number can only increase. In other words, even if the encrypter is compromised, an attacker cannot pretend that newly created ciphertexts were produced in the past.
