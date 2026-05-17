@@ -11,7 +11,7 @@ const Io = std.Io;
 
 const TmpFixture = struct {
     tmp: testing.TmpDir,
-    base: []u8, // owned
+    base: []u8,
 
     pub fn init(gpa: std.mem.Allocator) !TmpFixture {
         var t = testing.tmpDir(.{});
@@ -101,128 +101,115 @@ fn decryptKeyfileArgs(
     key_file: []const u8,
     input: []const u8,
     output: []const u8,
-    max_steps: u64,
 ) cli.DecryptArgs {
     return .{
         .key_file = key_file,
         .input = input,
         .output = output,
-        .max_key_steps = max_steps,
         .force = true,
     };
 }
 
-fn decryptPasswordArgs(input: []const u8, output: []const u8, max_steps: u64) cli.DecryptArgs {
+fn decryptPasswordArgs(input: []const u8, output: []const u8) cli.DecryptArgs {
     return .{
         .password = true,
         .input = input,
         .output = output,
-        .max_key_steps = max_steps,
         .force = true,
     };
 }
 
 const empty_env: std.process.Environ = .empty;
 
-test "init random mode writes both files with chain invariant" {
+test "init random mode writes EK and DK seed files" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "recovery.key");
     defer gpa.free(rec);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
-    const cur_bytes = try fix.readFile(gpa, "current.key");
-    defer gpa.free(cur_bytes);
+    const dev_bytes = try fix.readFile(gpa, "device.key");
+    defer gpa.free(dev_bytes);
     const rec_bytes = try fix.readFile(gpa, "recovery.key");
     defer gpa.free(rec_bytes);
 
-    try testing.expectEqual(@as(usize, 1 + crypto.MASTER_KEY_LEN), cur_bytes.len);
-    try testing.expectEqual(@as(usize, 1 + crypto.MASTER_KEY_LEN), rec_bytes.len);
-    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_PLAIN_V1), cur_bytes[0]);
-    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_RECOVERY_V1), rec_bytes[0]);
+    try testing.expectEqual(@as(usize, key_mod.EK_FILE_LEN), dev_bytes.len);
+    try testing.expectEqual(@as(usize, key_mod.DK_SEED_FILE_LEN), rec_bytes.len);
+    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_EK), dev_bytes[0]);
+    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_DK_SEED), rec_bytes[0]);
 
-    const cur_p = try key_mod.parseKeyFile(cur_bytes);
+    const dev_p = try key_mod.parseKeyFile(dev_bytes);
     const rec_p = try key_mod.parseKeyFile(rec_bytes);
-    try testing.expectEqual(key_mod.KeyRole.chain, cur_p.role);
-    try testing.expectEqual(key_mod.KeyRole.recovery, rec_p.role);
-
-    var evolved = rec_p.key;
-    crypto.evolveKey(&evolved);
-    try testing.expectEqualSlices(u8, &cur_p.key, &evolved);
+    try testing.expect(dev_p.isPublic());
+    try testing.expect(!rec_p.isPublic());
 }
 
-test "init random mode hex chain invariant" {
+test "init random mode hex" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "recovery.key");
     defer gpa.free(rec);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInitHex(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInitHex(dev, rec));
 
-    inline for (.{ "current.key", "recovery.key" }) |name| {
+    inline for (.{ "device.key", "recovery.key" }) |name| {
         const bytes = try fix.readFile(gpa, name);
         defer gpa.free(bytes);
         for (bytes) |b| try testing.expect(std.ascii.isHex(b) or std.ascii.isWhitespace(b));
     }
-
-    const cur_bytes = try fix.readFile(gpa, "current.key");
-    defer gpa.free(cur_bytes);
-    const rec_bytes = try fix.readFile(gpa, "recovery.key");
-    defer gpa.free(rec_bytes);
-    const cur_p = try key_mod.parseKeyFile(cur_bytes);
-    const rec_p = try key_mod.parseKeyFile(rec_bytes);
-    var evolved = rec_p.key;
-    crypto.evolveKey(&evolved);
-    try testing.expectEqualSlices(u8, &cur_p.key, &evolved);
 }
 
-test "init random mode files are mode 0600" {
+test "init random mode files are mode 0600/0644" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "recovery.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
-    inline for (.{ "current.key", "recovery.key" }) |name| {
-        var f = try fix.tmp.dir.openFile(testing.io, name, .{ .mode = .read_only });
-        defer f.close(testing.io);
-        const stat = try f.stat(testing.io);
-        if (@hasDecl(Io.File.Permissions, "toMode")) {
-            const mode: u32 = @intCast(stat.permissions.toMode() & 0o777);
-            try testing.expectEqual(@as(u32, 0o600), mode);
-        }
+    if (@hasDecl(Io.File.Permissions, "toMode")) {
+        var rf = try fix.tmp.dir.openFile(testing.io, "recovery.key", .{ .mode = .read_only });
+        defer rf.close(testing.io);
+        const rstat = try rf.stat(testing.io);
+        const rmode: u32 = @intCast(rstat.permissions.toMode() & 0o777);
+        try testing.expectEqual(@as(u32, 0o600), rmode);
+
+        var df = try fix.tmp.dir.openFile(testing.io, "device.key", .{ .mode = .read_only });
+        defer df.close(testing.io);
+        const dstat = try df.stat(testing.io);
+        const dmode: u32 = @intCast(dstat.permissions.toMode() & 0o777);
+        try testing.expectEqual(@as(u32, 0o644), dmode);
     }
 }
 
-test "password mode writes only current key" {
+test "password mode writes composite key" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
 
-    try pipeline.runInit(gpa, testing.io, passwordEnviron("hunter2"), passwordInit(cur));
-    const bytes = try fix.readFile(gpa, "current.key");
+    try pipeline.runInit(gpa, testing.io, passwordEnviron("hunter2"), passwordInit(dev));
+    const bytes = try fix.readFile(gpa, "device.key");
     defer gpa.free(bytes);
-    try testing.expectEqual(@as(usize, 1 + crypto.MASTER_KEY_LEN + format.ARGON2_METADATA_LEN), bytes.len);
-    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_COMPOSITE_V1), bytes[0]);
+    try testing.expectEqual(@as(usize, key_mod.COMPOSITE_FILE_LEN), bytes.len);
+    try testing.expectEqual(@as(u8, key_mod.KEY_TYPE_COMPOSITE), bytes[0]);
     const parsed = try key_mod.parseKeyFile(bytes);
-    try testing.expectEqual(key_mod.KeyRole.chain, parsed.role);
-    try testing.expect(parsed.kdf != null);
+    try testing.expect(!parsed.isPublic());
+    try testing.expect(parsed == .composite);
 }
 
 test "init paths must differ" {
@@ -241,11 +228,11 @@ test "random mode requires recovery_out" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
-    const args: cli.InitArgs = .{ .out = cur };
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
+    const args: cli.InitArgs = .{ .out = dev };
     try testing.expectError(error.RecoveryOutRequired, pipeline.runInit(gpa, testing.io, empty_env, args));
-    try testing.expect(!fix.exists("current.key"));
+    try testing.expect(!fix.exists("device.key"));
 }
 
 test "password mode rejects recovery_out" {
@@ -253,14 +240,14 @@ test "password mode rejects recovery_out" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "recovery.key");
     defer gpa.free(rec);
 
-    const args: cli.InitArgs = .{ .out = cur, .recovery_out = rec, .password = true, .argon2_mem = 8 * 1024, .argon2_iters = 1, .argon2_lanes = 1 };
+    const args: cli.InitArgs = .{ .out = dev, .recovery_out = rec, .password = true, .argon2_mem = 8 * 1024, .argon2_iters = 1, .argon2_lanes = 1 };
     try testing.expectError(error.RecoveryOutWithPassword, pipeline.runInit(gpa, testing.io, passwordEnviron("hunter2"), args));
-    try testing.expect(!fix.exists("current.key"));
+    try testing.expect(!fix.exists("device.key"));
     try testing.expect(!fix.exists("recovery.key"));
 }
 
@@ -280,11 +267,11 @@ test "argon2 flag without password rejected" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
-    const cur = try fix.path(gpa, "k.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "k.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "r.key");
     defer gpa.free(rec);
-    var a = randomInit(cur, rec);
+    var a = randomInit(dev, rec);
     a.argon2_mem = 65536;
     try testing.expectError(error.Argon2FlagsRequirePassword, pipeline.runInit(gpa, testing.io, empty_env, a));
     try testing.expect(!fix.exists("k.key"));
@@ -296,8 +283,8 @@ test "round trip recovers with offline key" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "current.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "device.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "recovery.key");
     defer gpa.free(rec);
     const plain = try fix.path(gpa, "plain.txt");
@@ -307,10 +294,10 @@ test "round trip recovers with offline key" {
     const out = try fix.path(gpa, "plain.out");
     defer gpa.free(out);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
     try fix.writeFile("plain.txt", "hello two-file init");
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, cipher));
-    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out, 1000));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, cipher));
+    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out));
 
     const got = try fix.readFile(gpa, "plain.out");
     defer gpa.free(got);
@@ -322,8 +309,8 @@ test "empty round trip" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
     const plain = try fix.path(gpa, "p");
@@ -333,10 +320,10 @@ test "empty round trip" {
     const out = try fix.path(gpa, "p.out");
     defer gpa.free(out);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
     try fix.writeFile("p", "");
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, cipher));
-    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out, 5));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, cipher));
+    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out));
     const got = try fix.readFile(gpa, "p.out");
     defer gpa.free(got);
     try testing.expectEqual(@as(usize, 0), got.len);
@@ -347,8 +334,8 @@ test "multi-chunk round trip" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
     const plain = try fix.path(gpa, "big.plain");
@@ -358,17 +345,17 @@ test "multi-chunk round trip" {
     const out = try fix.path(gpa, "big.out");
     defer gpa.free(out);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     const data = try gpa.alloc(u8, 250_000);
     defer gpa.free(data);
     for (data, 0..) |*b, i| b.* = @intCast(i % 251);
     try fix.writeFile("big.plain", data);
 
-    var args = encryptArgs(cur, plain, cipher);
+    var args = encryptArgs(dev, plain, cipher);
     args.chunk_size = 32 * 1024;
     try pipeline.runEncrypt(gpa, testing.io, args);
-    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out, 5));
+    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out));
 
     const got = try fix.readFile(gpa, "big.out");
     defer gpa.free(got);
@@ -380,8 +367,8 @@ test "exact chunk boundary" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
     const plain = try fix.path(gpa, "b.plain");
@@ -391,34 +378,34 @@ test "exact chunk boundary" {
     const out = try fix.path(gpa, "b.out");
     defer gpa.free(out);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
     const chunk: u32 = 4096;
     const data = try gpa.alloc(u8, chunk * 3);
     defer gpa.free(data);
     @memset(data, 0xa5);
     try fix.writeFile("b.plain", data);
 
-    var args = encryptArgs(cur, plain, cipher);
+    var args = encryptArgs(dev, plain, cipher);
     args.chunk_size = chunk;
     try pipeline.runEncrypt(gpa, testing.io, args);
-    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out, 5));
+    try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, cipher, out));
 
     const got = try fix.readFile(gpa, "b.out");
     defer gpa.free(got);
     try testing.expectEqualSlices(u8, data, got);
 }
 
-test "key evolution chain decrypts every backup" {
+test "multiple independent encryptions" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
 
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     var i: u32 = 0;
     while (i < 6) : (i += 1) {
@@ -439,29 +426,24 @@ test "key evolution chain decrypts every backup" {
         const payload = try std.fmt.allocPrint(gpa, "payload {d}", .{i});
         defer gpa.free(payload);
         try fix.writeFile(plain_name, payload);
-        try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain_path, ct_path));
-        try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, ct_path, out_path, 50));
+        try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain_path, ct_path));
+        try pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, ct_path, out_path));
         const got = try fix.readFile(gpa, out_name);
         defer gpa.free(got);
         try testing.expectEqualStrings(payload, got);
     }
 }
 
-test "encrypt rejects recovery key" {
+test "encrypt rejects DK seed key" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
-
-    const cur_before = try fix.readFile(gpa, "cur.key");
-    defer gpa.free(cur_before);
-    const rec_before = try fix.readFile(gpa, "rec.key");
-    defer gpa.free(rec_before);
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     const plain = try fix.path(gpa, "p.txt");
     defer gpa.free(plain);
@@ -469,27 +451,20 @@ test "encrypt rejects recovery key" {
     defer gpa.free(ct);
     try fix.writeFile("p.txt", "should not encrypt");
 
-    try testing.expectError(error.KeyfileIsRecovery, pipeline.runEncrypt(gpa, testing.io, encryptArgs(rec, plain, ct)));
-
-    const cur_after = try fix.readFile(gpa, "cur.key");
-    defer gpa.free(cur_after);
-    const rec_after = try fix.readFile(gpa, "rec.key");
-    defer gpa.free(rec_after);
-    try testing.expectEqualSlices(u8, cur_before, cur_after);
-    try testing.expectEqualSlices(u8, rec_before, rec_after);
+    try testing.expectError(error.KeyfileIsDkSeed, pipeline.runEncrypt(gpa, testing.io, encryptArgs(rec, plain, ct)));
     try testing.expect(!fix.exists("p.enc"));
 }
 
-test "decrypt rejects chain key" {
+test "decrypt rejects EK key" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     const plain = try fix.path(gpa, "p.txt");
     defer gpa.free(plain);
@@ -499,39 +474,39 @@ test "decrypt rejects chain key" {
     defer gpa.free(out);
 
     try fix.writeFile("p.txt", "hi");
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ct));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
 
-    try testing.expectError(error.KeyfileIsChain, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(cur, ct, out, 1000)));
+    try testing.expectError(error.KeyfileIsEk, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(dev, ct, out)));
     try testing.expect(!fix.exists("out.bin"));
 }
 
-test "wrong recovery key fails within max_steps" {
+test "wrong recovery key fails" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     const plain = try fix.path(gpa, "p.txt");
     defer gpa.free(plain);
     const ct = try fix.path(gpa, "p.enc");
     defer gpa.free(ct);
     try fix.writeFile("p.txt", "hello");
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ct));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
 
-    const other_cur = try fix.path(gpa, "other.cur");
-    defer gpa.free(other_cur);
+    const other_dev = try fix.path(gpa, "other.dev");
+    defer gpa.free(other_dev);
     const other_rec = try fix.path(gpa, "other.rec");
     defer gpa.free(other_rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(other_cur, other_rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(other_dev, other_rec));
 
     const out = try fix.path(gpa, "oops.out");
     defer gpa.free(out);
-    try testing.expectError(error.KeyChainExhausted, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(other_rec, ct, out, 16)));
+    try testing.expectError(error.AuthFailedForChunk, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(other_rec, ct, out)));
 }
 
 test "tampered chunk fails authentication" {
@@ -539,11 +514,11 @@ test "tampered chunk fails authentication" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     const data = try gpa.alloc(u8, 300_000);
     defer gpa.free(data);
@@ -554,7 +529,7 @@ test "tampered chunk fails authentication" {
     defer gpa.free(plain);
     const ct = try fix.path(gpa, "t.enc");
     defer gpa.free(ct);
-    var args = encryptArgs(cur, plain, ct);
+    var args = encryptArgs(dev, plain, ct);
     args.chunk_size = 64 * 1024;
     try pipeline.runEncrypt(gpa, testing.io, args);
 
@@ -565,7 +540,7 @@ test "tampered chunk fails authentication" {
 
     const out = try fix.path(gpa, "out.bin");
     defer gpa.free(out);
-    try testing.expectError(error.AuthFailedForChunk, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, ct, out, 1)));
+    try testing.expectError(error.AuthFailedForChunk, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(rec, ct, out)));
     try testing.expect(!fix.exists("out.bin"));
 }
 
@@ -574,11 +549,11 @@ test "refuse overwrite without force" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
     try fix.writeFile("o.plain", "x");
     try fix.writeFile("o.enc", "existing");
@@ -586,41 +561,37 @@ test "refuse overwrite without force" {
     defer gpa.free(plain);
     const ct = try fix.path(gpa, "o.enc");
     defer gpa.free(ct);
-    try testing.expectError(error.OutputExists, pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ct)));
+    try testing.expectError(error.OutputExists, pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct)));
 
     const after = try fix.readFile(gpa, "o.enc");
     defer gpa.free(after);
     try testing.expectEqualStrings("existing", after);
 }
 
-test "pre-rotation advances disk key" {
+test "device key unchanged after encryption" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
-    const k0_bytes = try fix.readFile(gpa, "cur.key");
-    defer gpa.free(k0_bytes);
-    const k0 = try key_mod.parseKeyFile(k0_bytes);
-    var expected = k0.key;
-    crypto.evolveKey(&expected);
+    const before = try fix.readFile(gpa, "dev.key");
+    defer gpa.free(before);
 
     try fix.writeFile("p.txt", "some plaintext");
     const plain = try fix.path(gpa, "p.txt");
     defer gpa.free(plain);
     const ctp = try fix.path(gpa, "p.enc");
     defer gpa.free(ctp);
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ctp));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ctp));
 
-    const after_bytes = try fix.readFile(gpa, "cur.key");
-    defer gpa.free(after_bytes);
-    const after = try key_mod.parseKeyFile(after_bytes);
-    try testing.expectEqualSlices(u8, &expected, &after.key);
+    const after = try fix.readFile(gpa, "dev.key");
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
 }
 
 test "password round trip" {
@@ -628,21 +599,21 @@ test "password round trip" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "k.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "k.key");
+    defer gpa.free(dev);
     const env = passwordEnviron("correct horse battery staple");
-    try pipeline.runInit(gpa, testing.io, env, passwordInit(cur));
+    try pipeline.runInit(gpa, testing.io, env, passwordInit(dev));
 
     try fix.writeFile("p", "top secret backup");
     const plain = try fix.path(gpa, "p");
     defer gpa.free(plain);
     const ct = try fix.path(gpa, "p.enc");
     defer gpa.free(ct);
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ct));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
 
     const out = try fix.path(gpa, "p.dec");
     defer gpa.free(out);
-    try pipeline.runDecrypt(gpa, testing.io, env, decryptPasswordArgs(ct, out, 8));
+    try pipeline.runDecrypt(gpa, testing.io, env, decryptPasswordArgs(ct, out));
 
     const got = try fix.readFile(gpa, "p.dec");
     defer gpa.free(got);
@@ -654,50 +625,71 @@ test "wrong password fails" {
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "k.key");
-    defer gpa.free(cur);
-    try pipeline.runInit(gpa, testing.io, passwordEnviron("right one"), passwordInit(cur));
+    const dev = try fix.path(gpa, "k.key");
+    defer gpa.free(dev);
+    try pipeline.runInit(gpa, testing.io, passwordEnviron("right one"), passwordInit(dev));
 
     try fix.writeFile("p", "x");
     const plain = try fix.path(gpa, "p");
     defer gpa.free(plain);
     const ct = try fix.path(gpa, "p.enc");
     defer gpa.free(ct);
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, plain, ct));
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
 
     const out = try fix.path(gpa, "oops.out");
     defer gpa.free(out);
-    try testing.expectError(error.KeyChainExhausted, pipeline.runDecrypt(gpa, testing.io, passwordEnviron("wrong one"), decryptPasswordArgs(ct, out, 4)));
+    try testing.expectError(error.WrongPassword, pipeline.runDecrypt(gpa, testing.io, passwordEnviron("wrong one"), decryptPasswordArgs(ct, out)));
 }
 
-test "current cannot decrypt past backup" {
+test "password hex round trip" {
     const gpa = testing.allocator;
     var fix = try TmpFixture.init(gpa);
     defer fix.deinit(gpa);
 
-    const cur = try fix.path(gpa, "cur.key");
-    defer gpa.free(cur);
+    const dev = try fix.path(gpa, "k.key");
+    defer gpa.free(dev);
+    const env = passwordEnviron("hex test pw");
+    try pipeline.runInit(gpa, testing.io, env, passwordInitHex(dev));
+
+    const dev_bytes = try fix.readFile(gpa, "k.key");
+    defer gpa.free(dev_bytes);
+    for (dev_bytes) |b| try testing.expect(std.ascii.isHex(b) or std.ascii.isWhitespace(b));
+
+    try fix.writeFile("p", "hex mode data");
+    const plain = try fix.path(gpa, "p");
+    defer gpa.free(plain);
+    const ct = try fix.path(gpa, "p.enc");
+    defer gpa.free(ct);
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
+
+    const out = try fix.path(gpa, "p.dec");
+    defer gpa.free(out);
+    try pipeline.runDecrypt(gpa, testing.io, env, decryptPasswordArgs(ct, out));
+
+    const got = try fix.readFile(gpa, "p.dec");
+    defer gpa.free(got);
+    try testing.expectEqualStrings("hex mode data", got);
+}
+
+test "device key cannot decrypt" {
+    const gpa = testing.allocator;
+    var fix = try TmpFixture.init(gpa);
+    defer fix.deinit(gpa);
+
+    const dev = try fix.path(gpa, "dev.key");
+    defer gpa.free(dev);
     const rec = try fix.path(gpa, "rec.key");
     defer gpa.free(rec);
-    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(cur, rec));
+    try pipeline.runInit(gpa, testing.io, empty_env, randomInit(dev, rec));
 
-    try fix.writeFile("p1", "first");
-    const p1 = try fix.path(gpa, "p1");
-    defer gpa.free(p1);
-    const c1 = try fix.path(gpa, "c1");
-    defer gpa.free(c1);
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, p1, c1));
+    try fix.writeFile("p", "secret");
+    const plain = try fix.path(gpa, "p");
+    defer gpa.free(plain);
+    const ct = try fix.path(gpa, "p.enc");
+    defer gpa.free(ct);
+    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(dev, plain, ct));
 
-    try fix.writeFile("p2", "second");
-    const p2 = try fix.path(gpa, "p2");
-    defer gpa.free(p2);
-    const c2 = try fix.path(gpa, "c2");
-    defer gpa.free(c2);
-    try pipeline.runEncrypt(gpa, testing.io, encryptArgs(cur, p2, c2));
-
-    // The current chain key cannot decrypt c1 because forward chain walking
-    // never goes backward. We use a chain key, so the role check trips first.
     const out = try fix.path(gpa, "oops.out");
     defer gpa.free(out);
-    try testing.expectError(error.KeyfileIsChain, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(cur, c1, out, 1000)));
+    try testing.expectError(error.KeyfileIsEk, pipeline.runDecrypt(gpa, testing.io, empty_env, decryptKeyfileArgs(dev, ct, out)));
 }

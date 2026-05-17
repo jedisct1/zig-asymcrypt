@@ -25,9 +25,9 @@ fn realMain(init: std.process.Init) !u8 {
         w.interface.print(
             \\
             \\Usage:
-            \\  asymcrypt init -o CURRENT [-r RECOVERY] [--password] [--hex] [--argon2-mem N] [--argon2-iters N] [--argon2-lanes N]
+            \\  asymcrypt init -o DEVICE [-r RECOVERY] [--password] [--hex] [--argon2-mem N] [--argon2-iters N] [--argon2-lanes N]
             \\  asymcrypt encrypt -k KEY [-i IN] [-o OUT] [--chunk-size N] [--force] [--insecure-perms]
-            \\  asymcrypt decrypt (-k RECOVERY | --password) [-i IN] [-o OUT] [--max-key-steps N] [--force] [--insecure-perms]
+            \\  asymcrypt decrypt (-k RECOVERY | --password) [-i IN] [-o OUT] [--force] [--insecure-perms]
             \\
         , .{}) catch {};
         w.interface.flush() catch {};

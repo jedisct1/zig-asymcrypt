@@ -31,8 +31,8 @@ pub fn deriveKeyFromPassword(
     io: std.Io,
     password: []const u8,
     meta: *const format.Argon2Meta,
-) !crypto.MasterKey {
-    var out: crypto.MasterKey = undefined;
+) !crypto.SharedSecret {
+    var out: crypto.SharedSecret = undefined;
     const params: std.crypto.pwhash.argon2.Params = .{
         .t = meta.iterations,
         .m = meta.mem_kib,
@@ -56,11 +56,6 @@ pub fn randomSalt(io: std.Io) ![16]u8 {
     return s;
 }
 
-/// If `ASYMCRYPT_PASSWORD` is set, its value is returned without prompting.
-/// Otherwise the prompt is written to stderr and a single line is read from
-/// stdin; with `confirm`, the user types it twice and the two are compared.
-///
-/// The returned slice is owned by the caller and must be zeroed and freed.
 pub fn readPassword(
     gpa: std.mem.Allocator,
     io: std.Io,

@@ -2,47 +2,37 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const format = @import("format.zig");
 
-pub const KEY_TYPE_PLAIN_V1: u8 = 0x01;
-pub const KEY_TYPE_COMPOSITE_V1: u8 = 0x02;
-pub const KEY_TYPE_RECOVERY_V1: u8 = 0x03;
+pub const KEY_TYPE_EK: u8 = 0x01;
+pub const KEY_TYPE_COMPOSITE: u8 = 0x02;
+pub const KEY_TYPE_DK_SEED: u8 = 0x03;
+
+pub const EK_FILE_LEN: usize = 1 + crypto.EK_LEN;
+pub const DK_SEED_FILE_LEN: usize = 1 + crypto.DK_SEED_LEN;
+pub const COMPOSITE_FILE_LEN: usize = 1 + crypto.EK_LEN + format.PASSWORD_BLOB_LEN;
 
 pub const KeyFileFormat = enum { raw, hex };
-pub const KeyRole = enum { chain, recovery };
 
-pub const KeyKind = union(enum) {
-    plain_chain,
-    composite_chain: format.Argon2Meta,
-    plain_recovery,
+pub const ParsedKeyFile = union(enum) {
+    encapsulation_key: struct {
+        ek_bytes: crypto.EncapsulationKey,
+        file_format: KeyFileFormat,
+    },
+    composite: struct {
+        ek_bytes: crypto.EncapsulationKey,
+        password_blob_bytes: [format.PASSWORD_BLOB_LEN]u8,
+        file_format: KeyFileFormat,
+    },
+    decapsulation_seed: struct {
+        seed: crypto.DecapsulationSeed,
+        file_format: KeyFileFormat,
+    },
 
-    pub fn typeByte(self: KeyKind) u8 {
-        return switch (self) {
-            .plain_chain => KEY_TYPE_PLAIN_V1,
-            .composite_chain => KEY_TYPE_COMPOSITE_V1,
-            .plain_recovery => KEY_TYPE_RECOVERY_V1,
-        };
-    }
-
-    pub fn kdfMeta(self: KeyKind) ?format.Argon2Meta {
-        return switch (self) {
-            .composite_chain => |m| m,
-            else => null,
-        };
-    }
-
-    pub fn chainFromKdf(kdf: ?format.Argon2Meta) KeyKind {
-        if (kdf) |m| return .{ .composite_chain = m };
-        return .plain_chain;
+    pub fn isPublic(self: ParsedKeyFile) bool {
+        return self == .encapsulation_key;
     }
 };
 
-pub const ParsedKeyFile = struct {
-    key: crypto.MasterKey,
-    kdf: ?format.Argon2Meta,
-    file_format: KeyFileFormat,
-    role: KeyRole,
-};
-
-pub const MAX_RAW_KEY_FILE_LEN = 1 + crypto.MASTER_KEY_LEN + format.ARGON2_METADATA_LEN;
+pub const MAX_RAW_KEY_FILE_LEN = COMPOSITE_FILE_LEN;
 pub const MAX_HEX_KEY_FILE_LEN = MAX_RAW_KEY_FILE_LEN * 2;
 
 pub const ParseError = error{
@@ -75,54 +65,89 @@ pub fn parseKeyFile(bytes: []const u8) ParseError!ParsedKeyFile {
 
 fn tryParseRaw(bytes: []const u8, file_format: KeyFileFormat) !?ParsedKeyFile {
     if (bytes.len == 0) return null;
-    const TagInfo = struct { role: KeyRole, expected_extra: usize, has_kdf: bool };
-    const info: TagInfo = switch (bytes[0]) {
-        KEY_TYPE_PLAIN_V1 => .{ .role = .chain, .expected_extra = 0, .has_kdf = false },
-        KEY_TYPE_COMPOSITE_V1 => .{ .role = .chain, .expected_extra = format.ARGON2_METADATA_LEN, .has_kdf = true },
-        KEY_TYPE_RECOVERY_V1 => .{ .role = .recovery, .expected_extra = 0, .has_kdf = false },
-        else => return null,
-    };
+    const tag = bytes[0];
     const body = bytes[1..];
-    if (body.len != crypto.MASTER_KEY_LEN + info.expected_extra) return error.BodyLengthMismatch;
-
-    var parsed: ParsedKeyFile = .{
-        .key = body[0..crypto.MASTER_KEY_LEN].*,
-        .kdf = null,
-        .file_format = file_format,
-        .role = info.role,
-    };
-    if (info.has_kdf) parsed.kdf = try format.Argon2Meta.decode(body[crypto.MASTER_KEY_LEN..]);
-    return parsed;
+    switch (tag) {
+        KEY_TYPE_EK => {
+            if (body.len != crypto.EK_LEN) return error.BodyLengthMismatch;
+            return .{ .encapsulation_key = .{
+                .ek_bytes = body[0..crypto.EK_LEN].*,
+                .file_format = file_format,
+            } };
+        },
+        KEY_TYPE_COMPOSITE => {
+            const expected = crypto.EK_LEN + format.PASSWORD_BLOB_LEN;
+            if (body.len != expected) return error.BodyLengthMismatch;
+            return .{ .composite = .{
+                .ek_bytes = body[0..crypto.EK_LEN].*,
+                .password_blob_bytes = body[crypto.EK_LEN..][0..format.PASSWORD_BLOB_LEN].*,
+                .file_format = file_format,
+            } };
+        },
+        KEY_TYPE_DK_SEED => {
+            if (body.len != crypto.DK_SEED_LEN) return error.BodyLengthMismatch;
+            return .{ .decapsulation_seed = .{
+                .seed = body[0..crypto.DK_SEED_LEN].*,
+                .file_format = file_format,
+            } };
+        },
+        else => return null,
+    }
 }
 
 pub const MAX_ENCODED_KEY_FILE_LEN = MAX_RAW_KEY_FILE_LEN * 2 + 1;
 
-pub fn encodeKeyFile(
+pub fn encodeEkFile(
     buffer: *[MAX_ENCODED_KEY_FILE_LEN]u8,
-    key: *const crypto.MasterKey,
-    kind: KeyKind,
+    ek_bytes: *const crypto.EncapsulationKey,
     file_format: KeyFileFormat,
 ) []u8 {
-    var raw_buf: [MAX_RAW_KEY_FILE_LEN]u8 = undefined;
+    var raw_buf: [EK_FILE_LEN]u8 = undefined;
+    raw_buf[0] = KEY_TYPE_EK;
+    raw_buf[1..][0..crypto.EK_LEN].* = ek_bytes.*;
+    return formatOutput(buffer, &raw_buf, file_format);
+}
+
+pub fn encodeDkSeedFile(
+    buffer: *[MAX_ENCODED_KEY_FILE_LEN]u8,
+    seed: *const crypto.DecapsulationSeed,
+    file_format: KeyFileFormat,
+) []u8 {
+    var raw_buf: [DK_SEED_FILE_LEN]u8 = undefined;
     defer std.crypto.secureZero(u8, &raw_buf);
+    raw_buf[0] = KEY_TYPE_DK_SEED;
+    raw_buf[1..][0..crypto.DK_SEED_LEN].* = seed.*;
+    return formatOutput(buffer, &raw_buf, file_format);
+}
 
-    var raw_len: usize = 1 + crypto.MASTER_KEY_LEN;
-    raw_buf[0] = kind.typeByte();
-    raw_buf[1..][0..crypto.MASTER_KEY_LEN].* = key.*;
-    if (kind.kdfMeta()) |meta| {
-        raw_buf[raw_len..][0..format.ARGON2_METADATA_LEN].* = meta.encode();
-        raw_len += format.ARGON2_METADATA_LEN;
-    }
+pub fn encodeCompositeFile(
+    buffer: *[MAX_ENCODED_KEY_FILE_LEN]u8,
+    ek_bytes: *const crypto.EncapsulationKey,
+    password_blob: *const [format.PASSWORD_BLOB_LEN]u8,
+    file_format: KeyFileFormat,
+) []u8 {
+    var raw_buf: [COMPOSITE_FILE_LEN]u8 = undefined;
+    defer std.crypto.secureZero(u8, &raw_buf);
+    raw_buf[0] = KEY_TYPE_COMPOSITE;
+    raw_buf[1..][0..crypto.EK_LEN].* = ek_bytes.*;
+    raw_buf[1 + crypto.EK_LEN ..][0..format.PASSWORD_BLOB_LEN].* = password_blob.*;
+    return formatOutput(buffer, &raw_buf, file_format);
+}
 
+fn formatOutput(
+    buffer: *[MAX_ENCODED_KEY_FILE_LEN]u8,
+    raw_buf: []const u8,
+    file_format: KeyFileFormat,
+) []u8 {
     switch (file_format) {
         .raw => {
-            @memcpy(buffer[0..raw_len], raw_buf[0..raw_len]);
-            return buffer[0..raw_len];
+            @memcpy(buffer[0..raw_buf.len], raw_buf);
+            return buffer[0..raw_buf.len];
         },
         .hex => {
-            const total = raw_len * 2 + 1;
+            const total = raw_buf.len * 2 + 1;
             const out = buffer[0..total];
-            return std.fmt.bufPrint(out, "{x}\n", .{raw_buf[0..raw_len]}) catch unreachable;
+            return std.fmt.bufPrint(out, "{x}\n", .{raw_buf}) catch unreachable;
         },
     }
 }
@@ -131,33 +156,8 @@ pub fn parentOrCwd(path: []const u8) []const u8 {
     return std.fs.path.dirname(path) orelse ".";
 }
 
-pub const KeyLock = struct {
-    file: std.Io.File,
-    io: std.Io,
-
-    pub fn acquire(io: std.Io, key_path: []const u8) !KeyLock {
-        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const lock_path = std.fmt.bufPrint(&path_buf, "{s}.lock", .{key_path}) catch
-            return error.NameTooLong;
-        const file = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .read = true,
-            .truncate = false,
-            .lock = .exclusive,
-        });
-        return .{ .file = file, .io = io };
-    }
-
-    pub fn release(self: *KeyLock) void {
-        self.file.close(self.io);
-        self.* = undefined;
-    }
-};
-
 pub const PermsError = error{InsecureKeyFilePermissions};
 
-/// Returns the file's permission bits (0..0o777) so callers can preserve the
-/// mode across rotation. Errors with `InsecureKeyFilePermissions` if any
-/// group/world bit is set and `allow_insecure` is false.
 pub fn checkKeyPermissions(
     io: std.Io,
     path: []const u8,
@@ -198,8 +198,6 @@ fn fileMode(stat: std.Io.File.Stat) u32 {
     return @intCast(stat.permissions.toMode() & 0o777);
 }
 
-/// Atomically write `bytes` to `path`. With `replace = false` the operation
-/// fails if `path` already exists.
 pub fn writeKeyFileDurable(
     io: std.Io,
     path: []const u8,
@@ -230,124 +228,117 @@ pub fn writeKeyFileDurable(
     if (replace) try atomic.replace(io) else try atomic.link(io);
 }
 
-pub fn randomKey(io: std.Io) !crypto.MasterKey {
-    var k: crypto.MasterKey = undefined;
-    try io.randomSecure(&k);
-    return k;
-}
-
-test "parse raw plain key" {
-    const key: crypto.MasterKey = @splat(7);
-    var bytes: [1 + crypto.MASTER_KEY_LEN]u8 = undefined;
-    bytes[0] = KEY_TYPE_PLAIN_V1;
-    bytes[1..].* = key;
-    const parsed = try parseKeyFile(&bytes);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expect(parsed.kdf == null);
-    try std.testing.expectEqual(KeyFileFormat.raw, parsed.file_format);
-    try std.testing.expectEqual(KeyRole.chain, parsed.role);
-}
-
-test "parse raw composite key" {
-    const key: crypto.MasterKey = @splat(0xa5);
-    const meta: format.Argon2Meta = .{
-        .salt = @splat(0x33),
-        .mem_kib = 65536,
-        .iterations = 3,
-        .parallelism = 4,
-    };
+test "parse raw EK" {
+    const ek: crypto.EncapsulationKey = @splat(7);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const enc = encodeKeyFile(&enc_buf, &key, .{ .composite_chain = meta }, .raw);
+    const enc = encodeEkFile(&enc_buf, &ek, .raw);
+    try std.testing.expectEqual(@as(usize, EK_FILE_LEN), enc.len);
+    try std.testing.expectEqual(@as(u8, KEY_TYPE_EK), enc[0]);
     const parsed = try parseKeyFile(enc);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expect(parsed.kdf.?.eql(meta));
-    try std.testing.expectEqual(KeyFileFormat.raw, parsed.file_format);
-    try std.testing.expectEqual(KeyRole.chain, parsed.role);
+    try std.testing.expectEqualSlices(u8, &ek, &parsed.encapsulation_key.ek_bytes);
+    try std.testing.expectEqual(KeyFileFormat.raw, parsed.encapsulation_key.file_format);
 }
 
-test "parse raw recovery key" {
-    const key: crypto.MasterKey = @splat(0x5a);
+test "parse raw DK seed" {
+    const seed: crypto.DecapsulationSeed = @splat(0x5a);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const enc = encodeKeyFile(&enc_buf, &key, .plain_recovery, .raw);
-    try std.testing.expectEqual(@as(u8, KEY_TYPE_RECOVERY_V1), enc[0]);
-    try std.testing.expectEqual(@as(usize, 1 + crypto.MASTER_KEY_LEN), enc.len);
+    const enc = encodeDkSeedFile(&enc_buf, &seed, .raw);
+    try std.testing.expectEqual(@as(usize, DK_SEED_FILE_LEN), enc.len);
+    try std.testing.expectEqual(@as(u8, KEY_TYPE_DK_SEED), enc[0]);
     const parsed = try parseKeyFile(enc);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expect(parsed.kdf == null);
-    try std.testing.expectEqual(KeyRole.recovery, parsed.role);
+    try std.testing.expectEqualSlices(u8, &seed, &parsed.decapsulation_seed.seed);
+    try std.testing.expectEqual(KeyFileFormat.raw, parsed.decapsulation_seed.file_format);
 }
 
-test "parse hex plain key" {
-    const key: crypto.MasterKey = @splat(0x11);
+test "parse raw composite" {
+    const ek: crypto.EncapsulationKey = @splat(0xa5);
+    const blob: [format.PASSWORD_BLOB_LEN]u8 = @splat(0x33);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const enc = encodeKeyFile(&enc_buf, &key, .plain_chain, .hex);
+    const enc = encodeCompositeFile(&enc_buf, &ek, &blob, .raw);
+    try std.testing.expectEqual(@as(usize, COMPOSITE_FILE_LEN), enc.len);
+    try std.testing.expectEqual(@as(u8, KEY_TYPE_COMPOSITE), enc[0]);
     const parsed = try parseKeyFile(enc);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expectEqual(KeyFileFormat.hex, parsed.file_format);
-    try std.testing.expectEqual(KeyRole.chain, parsed.role);
+    try std.testing.expectEqualSlices(u8, &ek, &parsed.composite.ek_bytes);
+    try std.testing.expectEqualSlices(u8, &blob, &parsed.composite.password_blob_bytes);
+    try std.testing.expectEqual(KeyFileFormat.raw, parsed.composite.file_format);
 }
 
-test "parse hex recovery key" {
-    const key: crypto.MasterKey = @splat(0x99);
+test "parse hex EK" {
+    const ek: crypto.EncapsulationKey = @splat(0x11);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const enc = encodeKeyFile(&enc_buf, &key, .plain_recovery, .hex);
+    const enc = encodeEkFile(&enc_buf, &ek, .hex);
+    const parsed = try parseKeyFile(enc);
+    try std.testing.expectEqualSlices(u8, &ek, &parsed.encapsulation_key.ek_bytes);
+    try std.testing.expectEqual(KeyFileFormat.hex, parsed.encapsulation_key.file_format);
+}
+
+test "parse hex DK seed" {
+    const seed: crypto.DecapsulationSeed = @splat(0x99);
+    var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+    const enc = encodeDkSeedFile(&enc_buf, &seed, .hex);
     for (enc) |b| try std.testing.expect(std.ascii.isHex(b) or b == '\n');
     const parsed = try parseKeyFile(enc);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expectEqual(KeyRole.recovery, parsed.role);
-    try std.testing.expectEqual(KeyFileFormat.hex, parsed.file_format);
+    try std.testing.expectEqualSlices(u8, &seed, &parsed.decapsulation_seed.seed);
+    try std.testing.expectEqual(KeyFileFormat.hex, parsed.decapsulation_seed.file_format);
 }
 
-test "parse hex composite key with surrounding whitespace" {
+test "parse hex composite with surrounding whitespace" {
     const gpa = std.testing.allocator;
-    const key: crypto.MasterKey = @splat(0x22);
-    const meta: format.Argon2Meta = .{
-        .salt = @splat(0x33),
-        .mem_kib = 65536,
-        .iterations = 3,
-        .parallelism = 4,
-    };
+    const ek: crypto.EncapsulationKey = @splat(0x22);
+    const blob: [format.PASSWORD_BLOB_LEN]u8 = @splat(0x44);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const enc = encodeKeyFile(&enc_buf, &key, .{ .composite_chain = meta }, .hex);
+    const enc = encodeCompositeFile(&enc_buf, &ek, &blob, .hex);
     var padded: std.ArrayList(u8) = .empty;
     defer padded.deinit(gpa);
     try padded.appendSlice(gpa, "   ");
     try padded.appendSlice(gpa, enc);
     try padded.appendSlice(gpa, "\n  \n");
     const parsed = try parseKeyFile(padded.items);
-    try std.testing.expectEqualSlices(u8, &key, &parsed.key);
-    try std.testing.expect(parsed.kdf.?.eql(meta));
-    try std.testing.expectEqual(KeyFileFormat.hex, parsed.file_format);
-    try std.testing.expectEqual(KeyRole.chain, parsed.role);
+    try std.testing.expectEqualSlices(u8, &ek, &parsed.composite.ek_bytes);
+    try std.testing.expectEqualSlices(u8, &blob, &parsed.composite.password_blob_bytes);
+    try std.testing.expectEqual(KeyFileFormat.hex, parsed.composite.file_format);
 }
 
 test "rejects short input" {
     try std.testing.expectError(error.UnrecognisedKeyFile, parseKeyFile(&.{}));
-    try std.testing.expectError(error.BodyLengthMismatch, parseKeyFile(&.{ KEY_TYPE_PLAIN_V1, 1, 2, 3 }));
+    try std.testing.expectError(error.BodyLengthMismatch, parseKeyFile(&.{ KEY_TYPE_DK_SEED, 1, 2, 3 }));
 }
 
-test "rejects recovery body wrong length" {
-    var bytes_short: [1 + crypto.MASTER_KEY_LEN - 1]u8 = .{KEY_TYPE_RECOVERY_V1} ++ @as([crypto.MASTER_KEY_LEN - 1]u8, @splat(0));
+test "rejects DK seed wrong length" {
+    var bytes_short: [1 + crypto.DK_SEED_LEN - 1]u8 = .{KEY_TYPE_DK_SEED} ++ @as([crypto.DK_SEED_LEN - 1]u8, @splat(0));
     try std.testing.expectError(error.BodyLengthMismatch, parseKeyFile(&bytes_short));
-    var bytes_long: [1 + crypto.MASTER_KEY_LEN + 1]u8 = .{KEY_TYPE_RECOVERY_V1} ++ @as([crypto.MASTER_KEY_LEN + 1]u8, @splat(0));
+    var bytes_long: [1 + crypto.DK_SEED_LEN + 1]u8 = .{KEY_TYPE_DK_SEED} ++ @as([crypto.DK_SEED_LEN + 1]u8, @splat(0));
     try std.testing.expectError(error.BodyLengthMismatch, parseKeyFile(&bytes_long));
 }
 
 test "rejects unknown type" {
-    var bytes: [1 + crypto.MASTER_KEY_LEN]u8 = undefined;
+    var bytes: [1 + crypto.EK_LEN]u8 = undefined;
     bytes[0] = 0xff;
     @memset(bytes[1..], 0);
     try std.testing.expectError(error.UnrecognisedKeyFile, parseKeyFile(&bytes));
 }
 
-test "rejects bad hex" {
-    try std.testing.expectError(error.UnrecognisedKeyFile, parseKeyFile("zz112233445566778899aabbccddeeff"));
+test "EK is public" {
+    const ek: crypto.EncapsulationKey = @splat(0);
+    var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+    const enc = encodeEkFile(&enc_buf, &ek, .raw);
+    const parsed = try parseKeyFile(enc);
+    try std.testing.expect(parsed.isPublic());
 }
 
-test "encode recovery first byte" {
-    const key: crypto.MasterKey = @splat(0);
+test "DK seed is not public" {
+    const seed: crypto.DecapsulationSeed = @splat(0);
     var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    const raw = encodeKeyFile(&enc_buf, &key, .plain_recovery, .raw);
-    try std.testing.expectEqual(@as(u8, KEY_TYPE_RECOVERY_V1), raw[0]);
-    try std.testing.expectEqual(@as(usize, 1 + crypto.MASTER_KEY_LEN), raw.len);
+    const enc = encodeDkSeedFile(&enc_buf, &seed, .raw);
+    const parsed = try parseKeyFile(enc);
+    try std.testing.expect(!parsed.isPublic());
+}
+
+test "composite is not public" {
+    const ek: crypto.EncapsulationKey = @splat(0);
+    const blob: [format.PASSWORD_BLOB_LEN]u8 = @splat(0);
+    var enc_buf: [MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+    const enc = encodeCompositeFile(&enc_buf, &ek, &blob, .raw);
+    const parsed = try parseKeyFile(enc);
+    try std.testing.expect(!parsed.isPublic());
 }

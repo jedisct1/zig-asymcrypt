@@ -29,54 +29,61 @@ pub fn runInit(
         if (try pathsEqual(args.out, rp)) return error.SamePathForCurrentAndRecovery;
     }
 
-    var kdf: ?format.Argon2Meta = null;
+    const kp = try crypto.kemGenerate(io);
+    var seed: crypto.DecapsulationSeed = kp[0];
+    defer std.crypto.secureZero(u8, &seed);
+    const ek_bytes: crypto.EncapsulationKey = kp[1];
+
     if (args.password) {
         const params = try password_mod.resolveArgon2Params(args.argon2_mem, args.argon2_iters, args.argon2_lanes);
-        kdf = .{
+        const meta: format.Argon2Meta = .{
             .salt = try password_mod.randomSalt(io),
             .mem_kib = params[0],
             .iterations = params[1],
             .parallelism = params[2],
         };
-    }
 
-    var k0: crypto.MasterKey = undefined;
-    defer std.crypto.secureZero(u8, &k0);
-
-    if (kdf) |meta| {
         const pw = try password_mod.readPassword(gpa, io, environ, "Password: ", true);
         defer {
             std.crypto.secureZero(u8, pw);
             gpa.free(pw);
         }
-        k0 = try password_mod.deriveKeyFromPassword(gpa, io, pw, &meta);
+        var argon2_key = try password_mod.deriveKeyFromPassword(gpa, io, pw, &meta);
+        defer std.crypto.secureZero(u8, &argon2_key);
+
+        const wrapped = crypto.wrapDkSeed(&argon2_key, &seed);
+        std.crypto.secureZero(u8, &seed);
+
+        const blob: format.PasswordBlob = .{
+            .encrypted_seed = wrapped[0],
+            .seed_tag = wrapped[1],
+            .argon2 = meta,
+        };
+        const blob_bytes = blob.encode();
+
+        var enc_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+        defer std.crypto.secureZero(u8, &enc_buf);
+        const file_bytes = key_mod.encodeCompositeFile(&enc_buf, &ek_bytes, &blob_bytes, file_format);
+        try key_mod.writeKeyFileDurable(io, args.out, file_bytes, 0o600, false);
     } else {
-        k0 = try key_mod.randomKey(io);
-    }
-
-    var k1: crypto.MasterKey = k0;
-    defer std.crypto.secureZero(u8, &k1);
-    crypto.evolveKey(&k1);
-
-    var current_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-    defer std.crypto.secureZero(u8, &current_buf);
-    const current_bytes = key_mod.encodeKeyFile(&current_buf, &k1, key_mod.KeyKind.chainFromKdf(kdf), file_format);
-
-    var recovery_persisted: ?[]const u8 = null;
-    if (args.recovery_out) |rp| {
-        var recovery_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-        defer std.crypto.secureZero(u8, &recovery_buf);
-        const recovery_bytes = key_mod.encodeKeyFile(&recovery_buf, &k0, .plain_recovery, file_format);
-        try key_mod.writeKeyFileDurable(io, rp, recovery_bytes, 0o600, false);
-        recovery_persisted = rp;
-    }
-
-    key_mod.writeKeyFileDurable(io, args.out, current_bytes, 0o600, false) catch |err| {
-        if (recovery_persisted) |rp| {
-            std.Io.Dir.cwd().deleteFile(io, rp) catch {};
+        var recovery_persisted: ?[]const u8 = null;
+        if (args.recovery_out) |rp| {
+            var enc_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+            defer std.crypto.secureZero(u8, &enc_buf);
+            const recovery_bytes = key_mod.encodeDkSeedFile(&enc_buf, &seed, file_format);
+            try key_mod.writeKeyFileDurable(io, rp, recovery_bytes, 0o600, false);
+            recovery_persisted = rp;
         }
-        return err;
-    };
+
+        var enc_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
+        const ek_file_bytes = key_mod.encodeEkFile(&enc_buf, &ek_bytes, file_format);
+        key_mod.writeKeyFileDurable(io, args.out, ek_file_bytes, 0o644, false) catch |err| {
+            if (recovery_persisted) |rp| {
+                std.Io.Dir.cwd().deleteFile(io, rp) catch {};
+            }
+            return err;
+        };
+    }
 }
 
 fn validateInitPath(io: std.Io, path: []const u8) !void {
@@ -101,41 +108,30 @@ pub fn runEncrypt(
 ) !void {
     try cli.validateChunkSize(args.chunk_size);
 
-    var lock = try key_mod.KeyLock.acquire(io, args.key_file);
-    defer lock.release();
-
-    const checked = try key_mod.readKeyFileChecked(io, gpa, args.key_file, args.insecure_perms);
-    const mode = checked.mode;
+    const checked = try key_mod.readKeyFileChecked(io, gpa, args.key_file, true);
     defer {
         std.crypto.secureZero(u8, checked.bytes);
         gpa.free(checked.bytes);
     }
     const parsed = try key_mod.parseKeyFile(checked.bytes);
-    if (parsed.role == .recovery) return error.KeyfileIsRecovery;
 
-    const key_format = parsed.file_format;
-    const kdf = parsed.kdf;
-    var stream_key: crypto.MasterKey = parsed.key;
-    defer std.crypto.secureZero(u8, &stream_key);
+    const ek_bytes: crypto.EncapsulationKey, const password_blob: ?format.PasswordBlob = switch (parsed) {
+        .encapsulation_key => |ek| .{ ek.ek_bytes, null },
+        .composite => |c| blk: {
+            _ = try key_mod.checkKeyPermissions(io, args.key_file, args.insecure_perms);
+            break :blk .{ c.ek_bytes, try format.PasswordBlob.decode(&c.password_blob_bytes) };
+        },
+        .decapsulation_seed => return error.KeyfileIsDkSeed,
+    };
 
     var input = try io_mod.Input.open(io, gpa, args.input);
     defer input.close(io);
     var output = try io_mod.Output.open(io, gpa, args.output, args.force);
     defer output.deinit(io);
 
-    // Pre-rotation: commit K_{n+1} to the key file *before* writing any
-    // ciphertext. After this, only this process holds K_n in memory; a
-    // mid-stream crash leaves any partial output undecryptable from the
-    // device's key file.
-    {
-        var next_key: crypto.MasterKey = stream_key;
-        defer std.crypto.secureZero(u8, &next_key);
-        crypto.evolveKey(&next_key);
-        var next_buf: [key_mod.MAX_ENCODED_KEY_FILE_LEN]u8 = undefined;
-        defer std.crypto.secureZero(u8, &next_buf);
-        const next_bytes = key_mod.encodeKeyFile(&next_buf, &next_key, key_mod.KeyKind.chainFromKdf(kdf), key_format);
-        try key_mod.writeKeyFileDurable(io, args.key_file, next_bytes, mode, true);
-    }
+    const encap = try crypto.kemEncapsulate(&ek_bytes, io);
+    var shared_secret: crypto.SharedSecret = encap[1];
+    defer std.crypto.secureZero(u8, &shared_secret);
 
     var file_nonce: crypto.FileNonce = undefined;
     try io.randomSecure(&file_nonce);
@@ -143,26 +139,23 @@ pub fn runEncrypt(
     const header: format.Header = .{
         .chunk_size = args.chunk_size,
         .file_nonce = file_nonce,
-        .kdf = kdf,
+        .kem_ciphertext = encap[0],
+        .password_blob = password_blob,
     };
 
     var ad_buf: [format.MAX_CHUNK_AD_LEN]u8 = undefined;
     const header_bytes = header.encode(ad_buf[0..format.MAX_HEADER_LEN]);
+    try output.writer().writeAll(header_bytes);
 
-    const kc = crypto.keyCheck(&stream_key, &file_nonce);
-    var header_vec: [2][]const u8 = .{ header_bytes, &kc };
-    try output.writer().writeVecAll(&header_vec);
-
-    const file_secrets = crypto.deriveFileSecrets(&stream_key, &file_nonce);
-    var file_key: crypto.CipherKey = file_secrets[0];
-    defer std.crypto.secureZero(u8, &file_key);
-    var base_nonce: crypto.Nonce = file_secrets[1];
-    defer std.crypto.secureZero(u8, &base_nonce);
+    var file_secrets = crypto.deriveFileSecrets(&shared_secret, &file_nonce);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&file_secrets));
+    const file_key: *crypto.CipherKey = &file_secrets[0];
+    const base_nonce: *crypto.Nonce = &file_secrets[1];
 
     const ctx: ChunkContext = .{
         .gpa = gpa,
-        .file_key = &file_key,
-        .base_nonce = &base_nonce,
+        .file_key = file_key,
+        .base_nonce = base_nonce,
         .ad_buf = &ad_buf,
         .header_len = header_bytes.len,
         .chunk_size = args.chunk_size,
@@ -176,8 +169,6 @@ const ChunkContext = struct {
     gpa: std.mem.Allocator,
     file_key: *const crypto.CipherKey,
     base_nonce: *const crypto.Nonce,
-    /// `ad_buf[0..header_len]` must already hold the encoded header; only
-    /// the trailing `CHUNK_AD_TRAILER_LEN` bytes are rewritten per chunk.
     ad_buf: *[format.MAX_CHUNK_AD_LEN]u8,
     header_len: usize,
     chunk_size: usize,
@@ -227,21 +218,27 @@ pub fn runDecrypt(
     environ: std.process.Environ,
     args: DecryptArgs,
 ) !void {
-    var prevalidated_key: ?crypto.MasterKey = null;
-    defer if (prevalidated_key) |*k| std.crypto.secureZero(u8, k);
+    var prevalidated_seed: ?crypto.DecapsulationSeed = null;
+    defer if (prevalidated_seed) |*s| std.crypto.secureZero(u8, s);
 
     if (args.password) {
         if (args.key_file != null) return error.NoKeyOrPassword;
     } else {
         const path = args.key_file orelse return error.NoKeyOrPassword;
-        const checked = try key_mod.readKeyFileChecked(io, gpa, path, args.insecure_perms);
+        const checked = try key_mod.readKeyFileChecked(io, gpa, path, true);
         defer {
             std.crypto.secureZero(u8, checked.bytes);
             gpa.free(checked.bytes);
         }
         const parsed = try key_mod.parseKeyFile(checked.bytes);
-        if (parsed.role != .recovery) return error.KeyfileIsChain;
-        prevalidated_key = parsed.key;
+        switch (parsed) {
+            .decapsulation_seed => |dk| {
+                _ = try key_mod.checkKeyPermissions(io, path, args.insecure_perms);
+                prevalidated_seed = dk.seed;
+            },
+            .encapsulation_key => return error.KeyfileIsEk,
+            .composite => return error.KeyfileIsComposite,
+        }
     }
 
     var input = try io_mod.Input.open(io, gpa, args.input);
@@ -252,38 +249,40 @@ pub fn runDecrypt(
     const header = parsed_header.header;
     const header_bytes = parsed_header.raw_bytes;
 
-    var candidate_key: crypto.MasterKey = undefined;
-    defer std.crypto.secureZero(u8, &candidate_key);
-    if (prevalidated_key) |k| {
-        candidate_key = k;
+    var shared_secret: crypto.SharedSecret = undefined;
+    defer std.crypto.secureZero(u8, &shared_secret);
+
+    if (prevalidated_seed) |seed| {
+        shared_secret = try crypto.kemDecapsulate(&seed, &header.kem_ciphertext);
     } else {
-        const kdf = header.kdf orelse return error.NoKeyOrPassword;
+        const blob = header.password_blob orelse return error.NotPasswordMode;
         const pw = try password_mod.readPassword(gpa, io, environ, "Password: ", false);
         defer {
             std.crypto.secureZero(u8, pw);
             gpa.free(pw);
         }
-        candidate_key = try password_mod.deriveKeyFromPassword(gpa, io, pw, &kdf);
+        var argon2_key = try password_mod.deriveKeyFromPassword(gpa, io, pw, &blob.argon2);
+        defer std.crypto.secureZero(u8, &argon2_key);
+
+        var seed = crypto.unwrapDkSeed(&argon2_key, &blob.encrypted_seed, &blob.seed_tag) catch
+            return error.WrongPassword;
+        defer std.crypto.secureZero(u8, &seed);
+
+        shared_secret = try crypto.kemDecapsulate(&seed, &header.kem_ciphertext);
     }
 
-    var stored_check: crypto.KeyCheck = undefined;
-    try input.reader().readSliceAll(&stored_check);
-
-    try findChainStep(io, &candidate_key, &header.file_nonce, &stored_check, args.max_key_steps);
-
-    const file_secrets = crypto.deriveFileSecrets(&candidate_key, &header.file_nonce);
-    var file_key: crypto.CipherKey = file_secrets[0];
-    defer std.crypto.secureZero(u8, &file_key);
-    var base_nonce: crypto.Nonce = file_secrets[1];
-    defer std.crypto.secureZero(u8, &base_nonce);
+    var file_secrets = crypto.deriveFileSecrets(&shared_secret, &header.file_nonce);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&file_secrets));
+    const file_key: *crypto.CipherKey = &file_secrets[0];
+    const base_nonce: *crypto.Nonce = &file_secrets[1];
 
     var output = try io_mod.Output.open(io, gpa, args.output, args.force);
     defer output.deinit(io);
 
     const ctx: ChunkContext = .{
         .gpa = gpa,
-        .file_key = &file_key,
-        .base_nonce = &base_nonce,
+        .file_key = file_key,
+        .base_nonce = base_nonce,
         .ad_buf = &ad_buf,
         .header_len = header_bytes.len,
         .chunk_size = header.chunk_size,
@@ -291,38 +290,6 @@ pub fn runDecrypt(
     try decryptChunks(ctx, &input, &output);
 
     try output.commit(io);
-}
-
-fn findChainStep(
-    io: std.Io,
-    candidate_key: *crypto.MasterKey,
-    file_nonce: *const crypto.FileNonce,
-    stored_check: *const crypto.KeyCheck,
-    max_steps: u64,
-) !void {
-    const stderr_is_tty = std.Io.File.stderr().isTty(io) catch false;
-    var stderr_buf: [128]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
-
-    var steps: u64 = 0;
-    while (true) {
-        const got = crypto.keyCheck(candidate_key, file_nonce);
-        if (std.crypto.timing_safe.eql([crypto.KEY_CHECK_LEN]u8, got, stored_check.*)) break;
-        if (steps >= max_steps) return error.KeyChainExhausted;
-        crypto.evolveKey(candidate_key);
-        steps += 1;
-        if (stderr_is_tty and steps % 1024 == 0) {
-            stderr_writer.interface.print("\rsearching key chain: {d} steps", .{steps}) catch {};
-            stderr_writer.interface.flush() catch {};
-        }
-    }
-    if (stderr_is_tty and steps >= 1024) {
-        stderr_writer.interface.print("\rkey chain matched at step {d}              \n", .{steps}) catch {};
-        stderr_writer.interface.flush() catch {};
-    } else if (steps > 0) {
-        stderr_writer.interface.print("asymcrypt: matched chain step {d}\n", .{steps}) catch {};
-        stderr_writer.interface.flush() catch {};
-    }
 }
 
 fn decryptChunks(ctx: ChunkContext, input: *io_mod.Input, output: *io_mod.Output) !void {

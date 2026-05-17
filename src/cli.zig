@@ -26,7 +26,6 @@ pub const DecryptArgs = struct {
     password: bool = false,
     input: ?[]const u8 = null,
     output: ?[]const u8 = null,
-    max_key_steps: u64 = 1_000_000,
     force: bool = false,
     insecure_perms: bool = false,
 };
@@ -62,9 +61,9 @@ const main_parsers = .{
 };
 
 const init_params = clap.parseParamsComptime(
-    \\-o, --out <PATH>           Path to write the chain key file (required).
-    \\-r, --recovery-out <PATH>  Path to write the recovery key file.
-    \\    --password             Derive the key from a password instead of generating one.
+    \\-o, --out <PATH>           Path for the device key (encapsulation key or composite).
+    \\-r, --recovery-out <PATH>  Path for the offline recovery key (decapsulation seed).
+    \\    --password             Derive wrapping key from a password instead of writing a recovery file.
     \\    --hex                  Encode key files as hex.
     \\    --argon2-mem <U32>     Argon2 memory in KiB.
     \\    --argon2-iters <U32>   Argon2 iterations.
@@ -73,7 +72,7 @@ const init_params = clap.parseParamsComptime(
 );
 
 const encrypt_params = clap.parseParamsComptime(
-    \\-k, --key-file <PATH>      Path to the chain key file (required).
+    \\-k, --key-file <PATH>      Path to the device key file (required).
     \\-i, --input <PATH>         Plaintext input path (default: stdin).
     \\-o, --output <PATH>        Ciphertext output path (default: stdout).
     \\    --chunk-size <U32>     Chunk size in bytes.
@@ -83,11 +82,10 @@ const encrypt_params = clap.parseParamsComptime(
 );
 
 const decrypt_params = clap.parseParamsComptime(
-    \\-k, --key-file <PATH>      Path to the recovery key file.
+    \\-k, --key-file <PATH>      Path to the offline recovery key (decapsulation seed).
     \\    --password             Read a password from the prompt instead of using a key file.
     \\-i, --input <PATH>         Ciphertext input path (default: stdin).
     \\-o, --output <PATH>        Plaintext output path (default: stdout).
-    \\    --max-key-steps <U64>  Maximum chain steps to walk during key search.
     \\    --force                Overwrite existing output file.
     \\    --insecure-perms       Skip key file permission check.
     \\
@@ -96,7 +94,6 @@ const decrypt_params = clap.parseParamsComptime(
 const value_parsers = .{
     .PATH = clap.parsers.string,
     .U32 = clap.parsers.int(u32, 10),
-    .U64 = clap.parsers.int(u64, 10),
 };
 
 pub fn parseFromIterator(gpa: std.mem.Allocator, iter: anytype) ParseError!Command {
@@ -157,7 +154,6 @@ fn parseDecrypt(gpa: std.mem.Allocator, iter: anytype) ParseError!DecryptArgs {
         .password = password,
         .input = res.args.input,
         .output = res.args.output,
-        .max_key_steps = res.args.@"max-key-steps" orelse 1_000_000,
         .force = res.args.force != 0,
         .insecure_perms = res.args.@"insecure-perms" != 0,
     };
