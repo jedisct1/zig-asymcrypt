@@ -4,7 +4,7 @@
 
 It works like [`encpipe`](https://github.com/jedisct1/encpipe): input defaults to `stdin`, output defaults to `stdout`, can process arbitrary large inputs ; file paths are optional.
 
-Encryption is authenticated, fast, post-quantum resistant, etc. The underlying cipher is [AEGIS-128X](https://datatracker.ietf.org/doc/draft-irtf-cfrg-aegis-aead/), a parallel AES-based AEAD that runs at memory speed on anything with hardware AES support.
+Encryption is authenticated, fast, post-quantum resistant, etc. The underlying cipher is [AEGIS-128X](https://www.rfc-editor.org/rfc/rfc10032.html), a parallel AES-based AEAD that runs at memory speed on anything with hardware AES support.
 
 Key encapsulation uses [X-Wing](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/) (ML-KEM-768 + X25519), a hybrid post-quantum KEM. Each encryption generates a fresh shared secret via KEM encapsulation against the public key, so the device key (a public encapsulation key) can never decrypt what it produced.
 
